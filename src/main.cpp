@@ -13,21 +13,25 @@
 #include "physButton/physButton.h"
 #include "confidential.h"
 
+// Constants
 #define WIFI_TIMEOUT_MS 20000
-// RFID
 #define SS_PIN 5
 #define RST_PIN 17
 #define KEYPAD_ADDR 0x20
 #define LCD_ADDR 0x27
+#define BAUD_RATE 115200
+#define VIBRATION_THRESHOLD 4000
+#define MAX_PASSWORD_LENGTH 8
+#define LCD_COLUMNS 16
+#define LCD_ROWS 2
 
-const int BAUD_RATE = 115200;
-const char *readJSON;
-const int motionPin = 16;
-const int vibrationPin = 35;
-const int magneticPin = 14;
-const int buzzerPin = 4;
-const int lcdColumns = 16;
-const int lcdRows = 2;
+// Pins
+const int MOTION_PIN = 16;
+const int VIBRATION_PIN = 35;
+const int MAGNETIC_PIN = 14;
+const int BUZZER_PIN = 4;
+
+// Keypad setup
 const byte ROWS = 4;
 const byte COLS = 4;
 char keys[ROWS][COLS] = {
@@ -37,9 +41,12 @@ char keys[ROWS][COLS] = {
     {'*', '0', '#', 'D'}};
 byte rowPins[ROWS] = {0, 1, 2, 3};
 byte colPins[COLS] = {4, 5, 6, 7};
+
+// Global Variables
+long motionValue;
 int vibrationValue;
-int vibrationThreshold = 0;
 int magneticValue;
+int wifiStatus = 1;
 int sirenStatus = 1;
 int rfidStatus = 1;
 int keypadStatus = 1;
@@ -51,18 +58,13 @@ int keypadAccess = 0;
 bool isAccessGranted = false;
 unsigned long rfidAccessTimestamp = 0;
 unsigned long keypadAccessTimestamp = 0;
-Supabase db;                  // Rest of supabase data confidential
-String table = "sensor_data"; // Target table
-
-// Instance of the classes
-MFRC522 mfrc522(SS_PIN, RST_PIN);
-LiquidCrystal_I2C lcd(LCD_ADDR, lcdColumns, lcdRows);
-Keypad_I2C keypad(makeKeymap(keys), rowPins, colPins, ROWS, COLS, KEYPAD_ADDR);
-
-// Keypad handling
 String keypadPassword = "";
-const int maxPasswordLength = 8;
 const String correctPassword = "123456";
+
+// Supabase
+Supabase db;
+String table = "sensor_data"; // Target table
+const char *readJSON;
 
 // Task handles
 TaskHandle_t task1Handle = NULL;
@@ -71,32 +73,39 @@ TaskHandle_t task2Handle = NULL;
 // Mutex handle
 SemaphoreHandle_t xSupabaseMutex;
 
+// Class Instances
+MFRC522 mfrc522(SS_PIN, RST_PIN);
+LiquidCrystal_I2C lcd(LCD_ADDR, LCD_COLUMNS, LCD_ROWS);
+Keypad_I2C keypad(makeKeymap(keys), rowPins, colPins, ROWS, COLS, KEYPAD_ADDR);
+
 // Function prototypes
 void initializePins();
 void handleKeypadInput(void *pvParameters);
 void handleSensors(void *pvParameters);
+void playWelcomeMelody();
+void onCorrectKeypadCode();
+void onCorrectRFIDRead();
+void checkSupabaseStatus();
 
 void initializePins()
 {
-  pinMode(motionPin, INPUT);
-  pinMode(vibrationPin, INPUT);
-  pinMode(magneticPin, INPUT_PULLUP);
-  pinMode(buzzerPin, OUTPUT);
+  pinMode(MOTION_PIN, INPUT);
+  pinMode(VIBRATION_PIN, INPUT);
+  pinMode(MAGNETIC_PIN, INPUT_PULLUP);
+  pinMode(BUZZER_PIN, OUTPUT);
 }
 
-void playWelcomeMelody(int buzzerPin)
+void playWelcomeMelody()
 {
-  // Define the notes and their durations
-  int melody[] = {262, 294, 330, 349, 392, 440, 494, 523};        // C4, D4, E4, F4, G4, A4, B4, C5
-  int noteDurations[] = {500, 500, 500, 500, 500, 500, 500, 500}; // Each note plays for 500ms
+  int melody[] = {262, 294, 330, 349, 392, 440, 494, 523};
+  int noteDurations[] = {500, 500, 500, 500, 500, 500, 500, 500};
 
   for (int i = 0; i < 8; i++)
   {
-    tone(buzzerPin, melody[i], noteDurations[i]); // Play note
-    delay(noteDurations[i] * 1.3);                // Add delay between notes
+    tone(BUZZER_PIN, melody[i], noteDurations[i]);
+    delay(noteDurations[i] * 1.3);
   }
-
-  noTone(buzzerPin); // Turn off the buzzer
+  noTone(BUZZER_PIN);
 }
 
 void onCorrectKeypadCode()
@@ -107,7 +116,7 @@ void onCorrectKeypadCode()
   lcd.setCursor(0, 0);
   lcd.print("Access granted");
   isAccessGranted = true;
-  playWelcomeMelody(buzzerPin);
+  playWelcomeMelody();
 }
 
 void onCorrectRFIDRead()
@@ -118,7 +127,152 @@ void onCorrectRFIDRead()
   lcd.setCursor(0, 0);
   lcd.print("Access granted");
   isAccessGranted = true;
-  playWelcomeMelody(buzzerPin);
+  playWelcomeMelody();
+}
+
+void lcdReset()
+{
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Enter password:");
+  lcd.setCursor(0, 1);
+  for (int i = 0; i < keypadPassword.length(); i++)
+  {
+    lcd.print('*'); // Display '*' for each key pressed
+  }
+}
+
+void resetAccess()
+{
+  if (isAccessGranted)
+  {
+    keypadPassword = "";
+    lcdReset();
+    isAccessGranted = false;
+  }
+}
+
+void semaphoreSendToSupabase(String name, int value)
+{
+  if (wifiStatus && xSemaphoreTake(xSupabaseMutex, portMAX_DELAY) == pdTRUE)
+  {
+    Serial.printf("Sending to Supabase: %s = %d\n", name.c_str(), value);
+    sendToSupabaseWrite(name, "value", value);
+    xSemaphoreGive(xSupabaseMutex);
+  }
+  else
+  {
+    Serial.println("Failed to acquire semaphore or WiFi not connected");
+  }
+}
+
+String semaphoreReadFromSupabase(String name)
+{
+  String read = "";
+  if (wifiStatus && xSemaphoreTake(xSupabaseMutex, portMAX_DELAY) == pdTRUE)
+  {
+    read = sendToSupabaseRead(name, "status");
+    xSemaphoreGive(xSupabaseMutex);
+  }
+  return read;
+}
+
+// Define states for the status check state machine
+enum SupabaseStatusCheckState
+{
+  CHECK_WIFI,
+  CHECK_RFID,
+  CHECK_SIREN,
+  CHECK_KEYPAD,
+  CHECK_VIBRATION,
+  CHECK_MAGNETIC,
+  CHECK_MOTION,
+  DONE_CHECKING
+};
+
+SupabaseStatusCheckState currentSupabaseState = CHECK_WIFI;
+unsigned long lastSupabaseCheckTime = 0;
+const unsigned long SUPABASE_CHECK_INTERVAL = 1000; // Interval in milliseconds between checks
+
+void checkSupabaseStatusAndWiFi()
+{
+  switch (currentSupabaseState)
+  {
+  case CHECK_WIFI:
+    if (millis() - lastSupabaseCheckTime >= SUPABASE_CHECK_INTERVAL)
+    {
+      wifiStatus = WiFi.status() == WL_CONNECTED ? 1 : 0;
+      lastSupabaseCheckTime = millis();
+      currentSupabaseState = CHECK_RFID; // Move to next state
+      Serial.println("Checked WiFi status");
+    }
+    break;
+
+  case CHECK_RFID:
+    if (millis() - lastSupabaseCheckTime >= SUPABASE_CHECK_INTERVAL)
+    {
+      rfidStatus = (semaphoreReadFromSupabase("rfid") == "on") ? 1 : 0;
+      lastSupabaseCheckTime = millis();
+      currentSupabaseState = CHECK_SIREN; // Move to next state
+      Serial.println("Checked RFID status");
+    }
+    break;
+
+  case CHECK_SIREN:
+    if (millis() - lastSupabaseCheckTime >= SUPABASE_CHECK_INTERVAL)
+    {
+      sirenStatus = (semaphoreReadFromSupabase("siren") == "on") ? 1 : 0;
+      lastSupabaseCheckTime = millis();
+      currentSupabaseState = CHECK_KEYPAD; // Move to next state
+      Serial.println("Checked SIREN status");
+    }
+    break;
+
+  case CHECK_KEYPAD:
+    if (millis() - lastSupabaseCheckTime >= SUPABASE_CHECK_INTERVAL)
+    {
+      keypadStatus = (semaphoreReadFromSupabase("keypad") == "on") ? 1 : 0;
+      lastSupabaseCheckTime = millis();
+      currentSupabaseState = CHECK_VIBRATION; // Move to next state
+      Serial.println("Checked KEYPAD status");
+    }
+    break;
+
+  case CHECK_VIBRATION:
+    if (millis() - lastSupabaseCheckTime >= SUPABASE_CHECK_INTERVAL)
+    {
+      vibrationStatus = (semaphoreReadFromSupabase("vibration") == "on") ? 1 : 0;
+      lastSupabaseCheckTime = millis();
+      currentSupabaseState = CHECK_MAGNETIC; // Move to next state
+      Serial.println("Checked VIBRATION status");
+    }
+    break;
+
+  case CHECK_MAGNETIC:
+    if (millis() - lastSupabaseCheckTime >= SUPABASE_CHECK_INTERVAL)
+    {
+      magneticStatus = (semaphoreReadFromSupabase("magnetic") == "on") ? 1 : 0;
+      lastSupabaseCheckTime = millis();
+      currentSupabaseState = CHECK_MOTION; // Move to next state
+      Serial.println("Checked MAGNETIC status");
+    }
+    break;
+
+  case CHECK_MOTION:
+    if (millis() - lastSupabaseCheckTime >= SUPABASE_CHECK_INTERVAL)
+    {
+      motionStatus = (semaphoreReadFromSupabase("motion") == "on") ? 1 : 0;
+      lastSupabaseCheckTime = millis();
+      currentSupabaseState = DONE_CHECKING; // Move to done state
+      Serial.println("Checked MOTION status");
+    }
+    break;
+
+  case DONE_CHECKING:
+    // Reset state machine or any other necessary cleanup
+    currentSupabaseState = CHECK_WIFI; // Example: Loop back to WIFI check
+    break;
+  }
 }
 
 void setup()
@@ -126,19 +280,17 @@ void setup()
   Serial.begin(BAUD_RATE);
   connectToWifi();
   initializePins();
-  SPI.begin();        // Init SPI communication
-  Wire.begin();       // Init I2C communication
-  mfrc522.PCD_Init(); // Init MFRC522
-  lcd.init();         // Init LCD
-  lcd.backlight();    // Turn on LCD backlight
-  keypad.begin();     // Init keypad
-
+  SPI.begin();
+  Wire.begin();
+  mfrc522.PCD_Init();
+  lcd.init();
+  lcd.backlight();
+  keypad.begin();
   db.begin(supabase_url, anon_key);
   db.login_email(email_a, password_a);
 
   // Create mutex
   xSupabaseMutex = xSemaphoreCreateMutex();
-
   Serial.printf("Free heap before tasks: %d\n", xPortGetFreeHeapSize());
 
   // Create tasks
@@ -160,292 +312,147 @@ void setup()
     Serial.println("Failed to create Task 2");
   }
 
-  Serial.printf("Task 1 handle: %p\n", task1Handle);
-  Serial.printf("Task 2 handle: %p\n", task2Handle);
-
   // Initialize LCD display
   lcd.setCursor(0, 0);
   lcd.print("Enter password:");
 }
 
-void checkSupabaseStatus()
-{
-  // Acquire mutex semaphore before accessing shared resources
-  // Example: Fetch status from Supabase or other external source
-  // Update global variables accordingly
-  delay(100);
-  Serial.println("Reading RFID status");
-  if (sendToSupabaseRead("rfid", "status") == "on")
-  {
-    rfidStatus = 1;
-  }
-  else
-  {
-    rfidStatus = 0;
-  }
-  delay(100);
-  Serial.println("Reading SIREN status");
-  if (sendToSupabaseRead("siren", "status") == "on")
-  {
-    sirenStatus = 1;
-  }
-  else
-  {
-    sirenStatus = 0;
-  }
-  delay(100);
-  Serial.println("Reading KEYPAD status");
-  if (sendToSupabaseRead("keypad", "status") == "on")
-  {
-    keypadStatus = 1;
-  }
-  else
-  {
-    keypadStatus = 0;
-  }
-  delay(100);
-  Serial.println("Reading VIBRATION status");
-  if (sendToSupabaseRead("vibration", "status") == "on")
-  {
-    vibrationStatus = 1;
-  }
-  else
-  {
-    vibrationStatus = 0;
-  }
-  delay(100);
-  Serial.println("Reading MAGNETIC status");
-  if (sendToSupabaseRead("magnetic", "status") == "on")
-  {
-    magneticStatus = 1;
-  }
-  else
-  {
-    magneticStatus = 0;
-  }
-  delay(100);
-  Serial.println("Reading MOTION status");
-  if (sendToSupabaseRead("motion", "status") == "on")
-  {
-    motionStatus = 1;
-  }
-  else
-  {
-    motionStatus = 0;
-  }
-  // Release mutex semaphore after updating shared resources
-}
-
 void loop()
 {
-  // Check status every 20 seconds
   static unsigned long lastStatusCheckTime = 0;
   unsigned long currentMillis = millis();
-  if (currentMillis - lastStatusCheckTime >= 30000)
+
+  // Check Supabase status every 30 seconds
+  if (currentMillis - lastStatusCheckTime >= 5000)
   {
-    Serial.println("Checking Supabase status");
-    // Acquire mutex semaphore before accessing shared resources
-    if (xSemaphoreTake(xSupabaseMutex, portMAX_DELAY) == pdTRUE)
-    {
-      Serial.println("Mutex acquired");
-      // Update LCD to show "Please wait..."
-      lcd.clear();
-      lcd.setCursor(0, 0);
-      lcd.print("Please wait...");
-      // Update status variables from Supabase or other source
-      checkSupabaseStatus();
-      // Revert LCD to "Enter password:"
-      lcd.clear();
-      lcd.setCursor(0, 0);
-      lcd.print("Enter password:");
-      lcd.setCursor(0, 1);
-      for (int i = 0; i < keypadPassword.length(); i++)
-      {
-        lcd.print('*'); // Display '*' for each key pressed
-      }
-      // Release mutex semaphore after updating shared resources
-      xSemaphoreGive(xSupabaseMutex);
-      Serial.println("Mutex released");
-    }
-    else
-    {
-      Serial.println("Failed to acquire mutex");
-    }
     lastStatusCheckTime = currentMillis;
+    // Questionable do display this since it takes so little to update
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Please wait...");
+    checkSupabaseStatusAndWiFi();
+    lcdReset();
   }
 
-  // Check if 5 seconds have passed since keypad access was granted
-  if (keypadAccess && currentMillis - keypadAccessTimestamp >= 5000)
-  {
-    keypadAccess = 0;
-    if (xSemaphoreTake(xSupabaseMutex, portMAX_DELAY) == pdTRUE)
-    {
-      sendToSupabaseWrite("keypad", "value", 0);
-      xSemaphoreGive(xSupabaseMutex);
-    }
-    if (isAccessGranted)
-    {
-      lcd.clear();
-      lcd.setCursor(0, 0);
-      lcd.print("Enter password:");
-      keypadPassword = "";
-      lcd.setCursor(0, 1);
-      for (int i = 0; i < keypadPassword.length(); i++)
-      {
-        lcd.print('*'); // Display '*' for each key pressed
-      }
-      isAccessGranted = false;
-    }
-  }
-
-  // Check if 5 seconds have passed since RFID access was granted
-  if (rfidAccess && currentMillis - rfidAccessTimestamp >= 5000)
-  {
-    rfidAccess = 0;
-    if (xSemaphoreTake(xSupabaseMutex, portMAX_DELAY) == pdTRUE)
-    {
-      sendToSupabaseWrite("rfid", "value", 0);
-      xSemaphoreGive(xSupabaseMutex);
-    }
-    if (isAccessGranted)
-    {
-      lcd.clear();
-      lcd.setCursor(0, 0);
-      lcd.print("Enter password:");
-      keypadPassword = "";
-      lcd.setCursor(0, 1);
-      for (int i = 0; i < keypadPassword.length(); i++)
-      {
-        lcd.print('*'); // Display '*' for each key pressed
-      }
-      isAccessGranted = false;
-    }
-  }
+  // Give control back to the FreeRTOS scheduler
+  vTaskDelay(1 / portTICK_PERIOD_MS);
 }
 
 void handleKeypadInput(void *pvParameters)
 {
+  unsigned long lastKeypadAccessTime = 0;
+  unsigned long lastRFIDAccessTime = 0;
+
   while (true)
   {
-    // if (xSemaphoreTake(xSupabaseMutex, portMAX_DELAY) == pdTRUE)
-    // {
-    // if (sendToSupabaseRead("keypad", "status") == "on")
-    // {
-    char key = keypad.getKey(); // Get the key pressed
-    if (key)
+    if (!keypadStatus)
     {
-      Serial.print("Key Pressed: ");
-      Serial.println(key);
-
-      if (key == '#') // Submit password
+      Serial.println("KEYPAD is turned OFF");
+    }
+    if (keypadStatus)
+    {
+      char key = keypad.getKey();
+      if (key)
       {
-        Serial.print("Entered Password: ");
-        Serial.println(keypadPassword);
-        // Add logic to verify password here
-        if (keypadPassword == correctPassword)
+        Serial.print("Key Pressed: ");
+        Serial.println(key);
+
+        if (key == '#') // Submit password
         {
-          onCorrectKeypadCode();
-          lcd.clear();
-          lcd.setCursor(0, 0);
-          lcd.print("Access granted");
-          if (xSemaphoreTake(xSupabaseMutex, portMAX_DELAY) == pdTRUE)
+          Serial.println((String) "Entered Password: " + keypadPassword);
+          if (keypadPassword == correctPassword) // Verify password
           {
-            sendToSupabaseWrite("keypad", "value", 1);
-            xSemaphoreGive(xSupabaseMutex);
+            onCorrectKeypadCode();
+            lcd.clear();
+            lcd.setCursor(0, 0);
+            lcd.print("Access granted");
+            semaphoreSendToSupabase("keypad", 1);
+            lastKeypadAccessTime = millis();
+            // vTaskDelay(100 / portTICK_PERIOD_MS);
           }
-          vTaskDelay(100 / portTICK_PERIOD_MS); // Display "Access granted" for 5 seconds
-          lcd.clear();
-          lcd.setCursor(0, 0);
-          lcd.print("Enter password:");
-          lcd.setCursor(0, 1);
-          for (int i = 0; i < keypadPassword.length(); i++)
+          else
           {
-            lcd.print('*'); // Display '*' for each key pressed
+            keypadAccess = 1;
+            lcd.clear();
+            lcd.setCursor(0, 0);
+            lcd.print("Incorrect");
+            lcd.setCursor(0, 1);
+            lcd.print("password");
+            vTaskDelay(2000 / portTICK_PERIOD_MS); // Display the message for 2 seconds
+            lcdReset();
           }
+          keypadPassword = "";
+          // lcd.setCursor(0, 1);
+          // lcd.print("                "); // Clear the second row
+        }
+        else if (key == '*')
+        {
+          keypadPassword = "";
+          lcdReset();
         }
         else
         {
-          lcd.clear();
-          lcd.setCursor(0, 0);
-          lcd.print("Incorrect");
-          lcd.setCursor(0, 1);
-          lcd.print("password");
-          vTaskDelay(2000 / portTICK_PERIOD_MS); // Display the message for 2 seconds
-          lcd.clear();
-          lcd.setCursor(0, 0);
-          lcd.print("Enter password:");
-          lcd.setCursor(0, 1);
-          for (int i = 0; i < keypadPassword.length(); i++)
+          if (keypadPassword.length() < MAX_PASSWORD_LENGTH)
           {
-            lcd.print('*'); // Display '*' for each key pressed
+            keypadPassword += key;
+            lcd.setCursor(keypadPassword.length() - 1, 1);
+            lcd.print('*');
           }
-        }
-        keypadPassword = "";
-        lcd.setCursor(0, 1);
-        lcd.print("                "); // Clear the second row
-      }
-      else if (key == '*') // Clear password
-      {
-        keypadPassword = ""; // Clear the password
-        lcd.setCursor(0, 1);
-        lcd.print("                "); // Clear the second row
-      }
-      else if (keypadPassword.length() < maxPasswordLength)
-      {
-        // lcd.setCursor(0, 1);           // Start from the beginning of the second row
-        // lcd.print("                "); // Clear the second row before writing the new password
-        keypadPassword += key; // Append key to password
-        lcd.setCursor(0, 1);
-        for (int i = 0; i < keypadPassword.length(); i++)
-        {
-          lcd.print('*'); // Display '*' for each key pressed
         }
       }
     }
-    // }
-    // xSemaphoreGive(xSupabaseMutex);
-    // }
-    // vTaskDelay(50 / portTICK_PERIOD_MS); // Delay to allow other tasks to run
 
-    if (rfidStatus)
+    if (!rfidStatus)
     {
-      if (mfrc522.PICC_IsNewCardPresent())
+      Serial.println("RFID is turned OFF");
+    }
+    if (rfidStatus && mfrc522.PICC_IsNewCardPresent() && mfrc522.PICC_ReadCardSerial())
+    {
+      Serial.print("UID tag: ");
+      String content = "";
+      byte letter;
+      for (byte i = 0; i < mfrc522.uid.size; i++)
       {
-        if (mfrc522.PICC_ReadCardSerial())
-        {
-          Serial.print("UID tag :");
-          String content = "";
-          byte letter;
-          for (byte i = 0; i < mfrc522.uid.size; i++)
-          {
-            Serial.print(mfrc522.uid.uidByte[i] < 0x10 ? " 0" : " ");
-            Serial.print(mfrc522.uid.uidByte[i], HEX);
-            content.concat(String(mfrc522.uid.uidByte[i] < 0x10 ? " 0" : " "));
-            content.concat(String(mfrc522.uid.uidByte[i], HEX));
-          }
-          Serial.println();
-          Serial.print("Message : ");
-          content.toUpperCase();
-          if (xSemaphoreTake(xSupabaseMutex, portMAX_DELAY) == pdTRUE)
-          {
-            if ((content.substring(1) == "7A 77 C7 B2") || (content.substring(1) == "43 10 73 0E"))
-            {
-              Serial.println("Authorized access");
-              onCorrectRFIDRead();
-              sendToSupabaseWrite("rfid", "value", 1);
-            }
-            else
-            {
-              Serial.println("Access denied");
-              rfidAccess = 0;
-              sendToSupabaseWrite("rfid", "value", 0);
-            }
-            xSemaphoreGive(xSupabaseMutex);
-          }
-        }
+        Serial.print(mfrc522.uid.uidByte[i] < 0x10 ? " 0" : " ");
+        Serial.print(mfrc522.uid.uidByte[i], HEX);
+        content.concat(String(mfrc522.uid.uidByte[i] < 0x10 ? " 0" : " "));
+        content.concat(String(mfrc522.uid.uidByte[i], HEX));
+      }
+      Serial.println();
+      Serial.print("Message: ");
+      content.toUpperCase();
+      if ((content.substring(1) == "7A 77 C7 B2") || (content.substring(1) == "43 10 73 0E"))
+      {
+        Serial.println("Authorized access");
+        onCorrectRFIDRead();
+        semaphoreSendToSupabase("rfid", 1);
+        lastRFIDAccessTime = millis();
+      }
+      else
+      {
+        Serial.println("Access denied");
+        rfidAccess = 1;
+        semaphoreSendToSupabase("rfid", 0);
       }
     }
-    vTaskDelay(50 / portTICK_PERIOD_MS); // Delay to allow other tasks to run
+
+    // Check and reset keypad access after 5 seconds
+    if (keypadAccess && millis() - lastKeypadAccessTime >= 5000)
+    {
+      keypadAccess = 0;
+      semaphoreSendToSupabase("keypad", 0);
+      resetAccess();
+    }
+
+    // Handle RFID access timeout similarly using millis() approach
+    if (rfidAccess && millis() - lastRFIDAccessTime >= 5000)
+    {
+      rfidAccess = 0;
+      semaphoreSendToSupabase("rfid", 0);
+      resetAccess();
+    }
+
+    vTaskDelay(50 / portTICK_PERIOD_MS); // Short delay to allow other tasks to run
   }
 }
 
@@ -453,72 +460,52 @@ void handleSensors(void *pvParameters)
 {
   while (true)
   {
-    if (WiFi.status() == WL_CONNECTED)
+    if (motionStatus)
     {
-      if (!rfidAccess && !keypadAccess)
-      {
-        if (xSemaphoreTake(xSupabaseMutex, portMAX_DELAY) == pdTRUE)
-        {
-          if (magneticStatus)
-          {
-            magneticValue = digitalRead(magneticPin);
-
-            Serial.print((String) "Magnetic value: " + magneticValue);
-            if (magneticValue == HIGH)
-            {
-              Serial.println(" - Door is open!");
-              if (sirenStatus == 1)
-              {
-                digitalWrite(buzzerPin, HIGH); // Turn on the buzzer
-              }
-              sendToSupabaseWrite("magnetic", "value", 1);
-            }
-            else
-            {
-              Serial.println(" - Door is closed!");
-              if (sirenStatus == 1)
-              {
-                digitalWrite(buzzerPin, LOW); // Turn off the buzzer
-              }
-              sendToSupabaseWrite("magnetic", "value", 0);
-            }
-
-            vTaskDelay(50 / portTICK_PERIOD_MS); // Delay before taking another reading
-          }
-          xSemaphoreGive(xSupabaseMutex);
-        }
-      }
-
-      if (xSemaphoreTake(xSupabaseMutex, portMAX_DELAY) == pdTRUE)
-      {
-        if (motionStatus)
-        {
-          long motionValue = digitalRead(motionPin);
-          if (motionValue == HIGH)
-          {
-            Serial.println("Motion detected!");
-          }
-          else
-          {
-            Serial.println("Motion absent!");
-          }
-          sendToSupabaseWrite("motion", "value", motionValue);
-          // vTaskDelay(250 / portTICK_PERIOD_MS); // Delay before taking another reading
-        }
-        xSemaphoreGive(xSupabaseMutex);
-      }
-
-      if (xSemaphoreTake(xSupabaseMutex, portMAX_DELAY) == pdTRUE)
-      {
-        if (vibrationStatus)
-        {
-          vibrationValue = analogRead(vibrationPin);
-          Serial.println((String) "Amplitudine vibratie: " + vibrationValue);
-          sendToSupabaseWrite("vibration", "value", vibrationValue);
-        }
-        xSemaphoreGive(xSupabaseMutex);
-      }
+      motionValue = digitalRead(MOTION_PIN);
+      Serial.println((motionValue == HIGH) ? "Motion detected" : "Motion stopped");
+      semaphoreSendToSupabase("motion", motionValue == HIGH ? 1 : 0);
+      // Delay after reading motion sensor 0.3sec is the minimum time interval
+      vTaskDelay(250 / portTICK_PERIOD_MS);
     }
-    vTaskDelay(50 / portTICK_PERIOD_MS); // Delay before taking another reading
+    else
+    {
+      Serial.println("MOTION is turned OFF");
+    }
+
+    if (vibrationStatus)
+    {
+      vibrationValue = analogRead(VIBRATION_PIN);
+      Serial.println(vibrationValue >= VIBRATION_THRESHOLD ? (String) "Vibration amplitude: " + vibrationValue + " - that's a hit!"
+                                                           : (String) "Vibration amplitude: " + vibrationValue);
+      if (sirenStatus)
+      {
+        digitalWrite(BUZZER_PIN, vibrationValue >= (VIBRATION_THRESHOLD - 500) ? HIGH : LOW);
+      }
+      semaphoreSendToSupabase("vibration", vibrationValue >= VIBRATION_THRESHOLD ? 1 : 0);
+    }
+    else
+    {
+      Serial.println("VIBRATION is turned OFF");
+    }
+
+    if (!magneticStatus)
+    {
+      Serial.println("MAGNETIC is turned OFF");
+    }
+    if (magneticStatus && !rfidAccess && !keypadAccess)
+    {
+      magneticValue = digitalRead(MAGNETIC_PIN);
+      Serial.println(magneticValue == HIGH ? (String) "Magnetic value: " + magneticValue + " - Door is open!"
+                                           : (String) "Magnetic value: " + magneticValue + " - Door is closed!");
+      if (sirenStatus)
+      {
+        digitalWrite(BUZZER_PIN, magneticValue == HIGH ? HIGH : LOW);
+      }
+      semaphoreSendToSupabase("magnetic", magneticValue == HIGH ? 1 : 0);
+    }
+
+    // Delay before the next iteration of the while loop
+    vTaskDelay(50 / portTICK_PERIOD_MS);
   }
 }

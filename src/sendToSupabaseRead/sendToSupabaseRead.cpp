@@ -36,7 +36,7 @@ String sendToSupabaseRead(String name, String column)
 
   readJSON = doc[0][column];
   // Serial.print(name + ": ");
-  // Serial.println(readJSON);
+  Serial.println(readJSON);
 
   db.urlQuery_reset();
 

@@ -7,10 +7,6 @@ extern String table;
 
 String sendToSupabaseRead(String name, String column)
 {
-  // Beginning Supabase Connection
-  // db.begin(supabase_url, anon_key);
-  // db.login_email(email_a, password_a);
-
   // Allocate the JSON document
   JsonDocument doc;
 

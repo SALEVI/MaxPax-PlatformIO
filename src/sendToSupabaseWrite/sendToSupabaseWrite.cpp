@@ -5,13 +5,6 @@ extern const char *readJSON;
 extern Supabase db;
 extern String table;
 
-// Program Initialization
-// void initializeProgram()
-// {
-//   db.begin(supabase_url, anon_key);
-//   db.login_email(email_a, password_a);
-// }
-
 void sendToSupabaseWrite(String name, String column, int value)
 {
   // Create JSON payload

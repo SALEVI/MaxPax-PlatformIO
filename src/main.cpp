@@ -10,7 +10,6 @@
 #include "connectToWifi/connectToWifi.h"
 #include "sendToSupabaseRead/sendToSupabaseRead.h"
 #include "sendToSupabaseWrite/sendToSupabaseWrite.h"
-#include "physButton/physButton.h"
 #include "confidential.h"
 
 // Constants
@@ -177,7 +176,7 @@ String semaphoreReadFromSupabase(String name)
   return read;
 }
 
-// Define states for the status check state machine
+// Define states for the status check
 enum SupabaseStatusCheckState
 {
   CHECK_WIFI,
@@ -269,8 +268,8 @@ void checkSupabaseStatusAndWiFi()
     break;
 
   case DONE_CHECKING:
-    // Reset state machine or any other necessary cleanup
-    currentSupabaseState = CHECK_WIFI; // Example: Loop back to WIFI check
+    // Reset
+    currentSupabaseState = CHECK_WIFI;
     break;
   }
 }
@@ -322,11 +321,10 @@ void loop()
   static unsigned long lastStatusCheckTime = 0;
   unsigned long currentMillis = millis();
 
-  // Check Supabase status every 30 seconds
+  // Check Supabase status
   if (currentMillis - lastStatusCheckTime >= 5000)
   {
     lastStatusCheckTime = currentMillis;
-    // Questionable do display this since it takes so little to update
     lcd.clear();
     lcd.setCursor(0, 0);
     lcd.print("Please wait...");
@@ -368,7 +366,6 @@ void handleKeypadInput(void *pvParameters)
             lcd.print("Access granted");
             semaphoreSendToSupabase("keypad", 1);
             lastKeypadAccessTime = millis();
-            // vTaskDelay(100 / portTICK_PERIOD_MS);
           }
           else
           {
@@ -382,8 +379,6 @@ void handleKeypadInput(void *pvParameters)
             lcdReset();
           }
           keypadPassword = "";
-          // lcd.setCursor(0, 1);
-          // lcd.print("                "); // Clear the second row
         }
         else if (key == '*')
         {
